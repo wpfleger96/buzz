@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     io::Write,
-    sync::{atomic::AtomicU16, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU16},
+        Arc, Mutex,
+    },
 };
 
 use nostr::{Keys, ToBech32};
@@ -33,6 +36,12 @@ pub struct AppState {
     pub audio_output_device: Mutex<Option<String>>,
     /// Port of the localhost media streaming proxy (set during setup).
     pub media_proxy_port: AtomicU16,
+    /// Set when identity resolution detected a "lost" state: the migration
+    /// marker was present but the keyring was empty and no plaintext fallback
+    /// existed. An ephemeral key was generated to let the app boot; the
+    /// frontend checks this flag via `get_identity` and routes to the nsec
+    /// re-import step instead of the normal onboarding profile flow.
+    pub identity_lost: AtomicBool,
     /// Cached ACP session config from running agents, keyed by agent pubkey.
     /// Populated when the harness emits `session_config_captured` observer events.
     pub session_config_cache: Mutex<HashMap<String, SessionConfigCache>>,
@@ -104,6 +113,7 @@ pub fn build_app_state() -> AppState {
         prevent_sleep: Arc::new(Mutex::new(
             crate::prevent_sleep::PreventSleepState::default(),
         )),
+        identity_lost: AtomicBool::new(false),
         #[cfg(feature = "mesh-llm")]
         mesh_llm_runtime: AsyncMutex::new(None),
         #[cfg(feature = "mesh-llm")]
@@ -163,6 +173,10 @@ impl AppState {
 ///
 /// Writes use `atomic-write-file` which handles temp file creation, fsync,
 /// atomic rename, and directory sync — no partial or corrupt files on disk.
+///
+/// Sets `state.identity_lost` when the keyring held a migration marker but
+/// was empty with no plaintext fallback — the app boots with an ephemeral key
+/// and the frontend is expected to prompt the user to re-import their nsec.
 pub fn resolve_persisted_identity(app: &AppHandle, state: &AppState) -> Result<(), String> {
     // Only skip file-based resolution if the env var was present AND parsed
     // successfully. A malformed env var should fall through to the persisted
@@ -177,8 +191,11 @@ pub fn resolve_persisted_identity(app: &AppHandle, state: &AppState) -> Result<(
         .map_err(|e| format!("app data dir: {e}"))?;
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create app data dir: {e}"))?;
 
-    let keys = load_or_create_identity(&data_dir)?;
-    *state.keys.lock().map_err(|e| e.to_string())? = keys;
+    let resolved = load_or_create_identity(&data_dir)?;
+    state
+        .identity_lost
+        .store(resolved.lost, std::sync::atomic::Ordering::Relaxed);
+    *state.keys.lock().map_err(|e| e.to_string())? = resolved.keys;
     Ok(())
 }
 
@@ -187,7 +204,7 @@ pub fn resolve_persisted_identity(app: &AppHandle, state: &AppState) -> Result<(
 pub(crate) const KEYRING_SERVICE: &str = "buzz-desktop";
 
 /// Keyring key name for the human identity nsec.
-const IDENTITY_KEY_NAME: &str = "identity";
+pub(crate) const IDENTITY_KEY_NAME: &str = "identity";
 
 /// Filename of the marker written once a successful keyring migration deletes
 /// the legacy `identity.key`. Its presence is the only durable signal that a
@@ -195,6 +212,15 @@ const IDENTITY_KEY_NAME: &str = "identity";
 /// (no key anywhere, generating is correct) from a post-migration boot whose
 /// keyring is merely unreachable (the key IS in the keyring, must NOT generate).
 const MIGRATION_MARKER_NAME: &str = "identity.migrated";
+
+/// The output of identity resolution. `lost = true` means the keyring was
+/// reachable-but-empty after a prior successful migration (marker present, no
+/// file) — the key vanished from the keyring externally. An ephemeral key is
+/// provided so the app can boot; the frontend must prompt re-import.
+struct ResolvedIdentity {
+    keys: Keys,
+    lost: bool,
+}
 
 /// The keyring operations the identity resolution flow needs. Abstracted so the
 /// corrupt-keyring recovery decision ([`recover_from_keyring`]) can be
@@ -230,12 +256,13 @@ impl IdentityKeyStore for crate::secret_store::SecretStore {
 /// this boot, fall back to reading the file directly and do NOT migrate — a
 /// later import from a leftover (possibly rotated) file could resurrect an old
 /// key.
-fn load_or_create_identity(data_dir: &std::path::Path) -> Result<Keys, String> {
+fn load_or_create_identity(data_dir: &std::path::Path) -> Result<ResolvedIdentity, String> {
     let legacy_path = data_dir.join("identity.key");
 
     // No keyring available in this build: the `0o600` file is the only store.
     if !cfg!(feature = "system-keyring") {
-        return load_file_or_generate(&legacy_path, data_dir);
+        let keys = load_file_or_generate(&legacy_path, data_dir)?;
+        return Ok(ResolvedIdentity { keys, lost: false });
     }
 
     let store = crate::secret_store::SecretStore::shared(KEYRING_SERVICE);
@@ -249,37 +276,76 @@ fn resolve_identity_with_store(
     store: &impl IdentityKeyStore,
     legacy_path: &std::path::Path,
     data_dir: &std::path::Path,
-) -> Result<Keys, String> {
+) -> Result<ResolvedIdentity, String> {
     use crate::secret_store::KeyringProbe;
 
     match store.probe(IDENTITY_KEY_NAME) {
         KeyringProbe::Present => {
             if let Some(nsec) = store.load(IDENTITY_KEY_NAME)? {
                 match Keys::parse(nsec.trim()) {
-                    Ok(keys) => {
+                    Ok(keyring_keys) => {
                         eprintln!(
                             "buzz-desktop: persisted identity pubkey {}",
-                            keys.public_key().to_hex()
+                            keyring_keys.public_key().to_hex()
                         );
-                        // The key is authoritative in the keyring. A leftover
-                        // `identity.key` means a prior migration's `remove_file`
-                        // failed (transient AV lock, read-only mount, EPERM) and
-                        // never retried — clean it up now so plaintext does not
-                        // linger on disk.
-                        cleanup_leftover_identity_file(legacy_path);
-                        return Ok(keys);
+                        // Check for a leftover identity.key. If it holds a
+                        // DIFFERENT pubkey, the user imported that key after
+                        // the last boot (pre-fix, import only wrote the file).
+                        // Adopt it into the keyring so the user's intent sticks.
+                        // If the pubkeys match it is a stale leftover from a
+                        // prior migration whose remove_file failed — clean it up.
+                        if legacy_path.exists() {
+                            match load_key_file(legacy_path) {
+                                Ok(file_keys)
+                                    if file_keys.public_key() != keyring_keys.public_key() =>
+                                {
+                                    let file_nsec = file_keys
+                                        .secret_key()
+                                        .to_bech32()
+                                        .map_err(|e| format!("encode nsec: {e}"))?;
+                                    eprintln!(
+                                        "buzz-desktop: identity.key differs from keyring; \
+                                         adopting imported key {}",
+                                        file_keys.public_key().to_hex()
+                                    );
+                                    store.store(IDENTITY_KEY_NAME, &file_nsec)?;
+                                    match store.load(IDENTITY_KEY_NAME)? {
+                                        Some(stored) if stored == file_nsec => {}
+                                        _ => {
+                                            return Err("keyring read-back verify failed \
+                                                 after adopting identity.key"
+                                                .to_string());
+                                        }
+                                    }
+                                    if let Err(e) = std::fs::remove_file(legacy_path) {
+                                        eprintln!(
+                                            "buzz-desktop: failed to delete identity.key \
+                                             after adopting: {e}"
+                                        );
+                                    }
+                                    return Ok(ResolvedIdentity {
+                                        keys: file_keys,
+                                        lost: false,
+                                    });
+                                }
+                                // Same pubkey (stale leftover) or corrupt file
+                                // — keyring is authoritative; clean up plaintext.
+                                _ => cleanup_leftover_identity_file(legacy_path),
+                            }
+                        }
+                        return Ok(ResolvedIdentity {
+                            keys: keyring_keys,
+                            lost: false,
+                        });
                     }
                     // The corruption is in the KEYRING, not the file. Clear the
                     // bad keyring value and recover from the file (or generate
                     // fresh) — do NOT quarantine a valid leftover `identity.key`
                     // that holds the user's only good key.
                     Err(error) => {
-                        return recover_from_keyring(
-                            store,
-                            legacy_path,
-                            data_dir,
-                            &error.to_string(),
-                        );
+                        let keys =
+                            recover_from_keyring(store, legacy_path, data_dir, &error.to_string())?;
+                        return Ok(ResolvedIdentity { keys, lost: false });
                     }
                 }
             }
@@ -290,8 +356,27 @@ fn resolve_identity_with_store(
             // verify, THEN delete it.
             if legacy_path.exists() {
                 if let Some(keys) = migrate_identity_file(store, legacy_path, data_dir)? {
-                    return Ok(keys);
+                    return Ok(ResolvedIdentity { keys, lost: false });
                 }
+            } else if migration_marker_path(data_dir).exists() {
+                // Marker present, keyring empty, no file — the key was previously
+                // durably stored in the keyring but is now gone (keyring cleared,
+                // new login session, or the entry was externally deleted). There
+                // is no plaintext fallback to recover from.
+                //
+                // Generate an ephemeral in-memory key so the app can boot, but
+                // surface a "lost" flag so the frontend prompts re-import rather
+                // than silently starting a fresh identity.
+                let ephemeral = Keys::generate();
+                eprintln!(
+                    "buzz-desktop: identity lost — keyring was empty despite migration marker; \
+                     using ephemeral key {}, awaiting user re-import",
+                    ephemeral.public_key().to_hex()
+                );
+                return Ok(ResolvedIdentity {
+                    keys: ephemeral,
+                    lost: true,
+                });
             }
         }
         KeyringProbe::Unreachable => {
@@ -311,11 +396,13 @@ fn resolve_identity_with_store(
                         .to_string(),
                 );
             }
-            return load_file_or_generate(legacy_path, data_dir);
+            let keys = load_file_or_generate(legacy_path, data_dir)?;
+            return Ok(ResolvedIdentity { keys, lost: false });
         }
     }
 
-    generate_and_persist(store, legacy_path, data_dir)
+    let keys = generate_and_persist(store, legacy_path, data_dir)?;
+    Ok(ResolvedIdentity { keys, lost: false })
 }
 
 /// Recover from a corrupt nsec in the keyring (parse failed). Clear the bad
@@ -414,6 +501,66 @@ fn migrate_identity_file(
         }
         _ => Err("keyring read-back verify failed for identity key".to_string()),
     }
+}
+
+/// Persist `keys` into the keyring with read-back verification, write the
+/// migration marker, and delete any leftover `identity.key`. Returns `Ok` on
+/// success. Returns `Err` when the keyring write fails (availability error) —
+/// the caller must fall back to `save_key_file` so the key survives the boot.
+///
+/// This is the shared kernel used by both one-time file migration and the
+/// `import_identity` command. Crash-safe ordering: marker is written BEFORE
+/// deleting the file.
+fn persist_identity_to_keyring(
+    store: &impl IdentityKeyStore,
+    keys: &Keys,
+    legacy_path: &std::path::Path,
+    data_dir: &std::path::Path,
+) -> Result<(), String> {
+    let nsec = keys
+        .secret_key()
+        .to_bech32()
+        .map_err(|e| format!("encode nsec: {e}"))?;
+
+    // Will error if the keyring is unavailable — caller falls back to the file.
+    store.store(IDENTITY_KEY_NAME, &nsec)?;
+
+    // Read-back verify before touching durable state.
+    match store.load(IDENTITY_KEY_NAME)? {
+        Some(stored) if stored == nsec => {}
+        _ => return Err("keyring read-back verify failed".to_string()),
+    }
+
+    // Write marker before deleting the file (crash-safe ordering).
+    let marker_path = migration_marker_path(data_dir);
+    if let Err(e) = write_migration_marker(&marker_path) {
+        eprintln!(
+            "buzz-desktop: keyring write ok but failed to write migration marker ({e}); \
+             keeping identity.key so the key is not stranded"
+        );
+        return Ok(());
+    }
+
+    if legacy_path.exists() {
+        if let Err(e) = std::fs::remove_file(legacy_path) {
+            eprintln!("buzz-desktop: keyring write ok but failed to delete identity.key: {e}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Public-crate wrapper around [`persist_identity_to_keyring`] for use by the
+/// `import_identity` Tauri command. Takes the concrete [`SecretStore`] type so
+/// the command does not need visibility into the private `IdentityKeyStore`
+/// trait.
+pub(crate) fn import_identity_to_keyring(
+    store: &crate::secret_store::SecretStore,
+    keys: &Keys,
+    legacy_path: &std::path::Path,
+    data_dir: &std::path::Path,
+) -> Result<(), String> {
+    persist_identity_to_keyring(store, keys, legacy_path, data_dir)
 }
 
 /// Path of the migration-completed marker within `data_dir`.
@@ -835,7 +982,7 @@ mod tests {
         let resolved = resolve_identity_with_store(&store, &legacy_path, dir.path()).unwrap();
 
         // The FILE's identity is recovered — NOT a freshly generated one.
-        assert_key_eq(&file_keys, &resolved);
+        assert_key_eq(&file_keys, &resolved.keys);
         // The corrupt keyring value was cleared.
         assert_eq!(store.deleted.borrow().as_slice(), [IDENTITY_KEY_NAME]);
         // The keyring now holds the file's key (migrated in, read-back verified).
@@ -875,24 +1022,27 @@ mod tests {
         let stored = store.slot.borrow().get(IDENTITY_KEY_NAME).cloned();
         assert_eq!(
             stored.as_deref(),
-            Some(resolved.secret_key().to_bech32().unwrap().as_str())
+            Some(resolved.keys.secret_key().to_bech32().unwrap().as_str())
         );
     }
 
     #[test]
-    fn valid_keyring_is_used_and_leftover_file_cleaned_up() {
-        // The happy path is unchanged: a valid keyring value is used as-is, and
-        // a leftover plaintext file is cleaned up (keyring is authoritative).
+    fn valid_keyring_is_used_and_matching_leftover_file_cleaned_up() {
+        // A valid keyring entry and a leftover identity.key with the SAME pubkey
+        // (stale leftover from a migration whose remove_file previously failed):
+        // keyring wins, plaintext is removed without adoption.
         let keyring_keys = Keys::generate();
         let nsec = keyring_keys.secret_key().to_bech32().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let legacy_path = dir.path().join("identity.key");
-        save_key_file(&legacy_path, &Keys::generate()).unwrap();
+        // Same key in file as keyring → stale leftover, not an import.
+        save_key_file(&legacy_path, &keyring_keys).unwrap();
 
         let store = FakeIdentityStore::present_with(&nsec);
         let resolved = resolve_identity_with_store(&store, &legacy_path, dir.path()).unwrap();
 
-        assert_key_eq(&keyring_keys, &resolved);
+        assert_key_eq(&keyring_keys, &resolved.keys);
+        assert!(!resolved.lost);
         assert!(store.deleted.borrow().is_empty());
         assert!(!legacy_path.exists());
     }
@@ -935,7 +1085,7 @@ mod tests {
 
         // A fresh key was generated and persisted to the file (keyring is down).
         let from_file = load_key_file(&legacy_path).unwrap();
-        assert_key_eq(&resolved, &from_file);
+        assert_key_eq(&resolved.keys, &from_file);
     }
 
     #[test]
@@ -953,7 +1103,7 @@ mod tests {
         let store = FakeIdentityStore::reachable_but_empty();
         let resolved = resolve_identity_with_store(&store, &legacy_path, dir.path()).unwrap();
 
-        assert_key_eq(&file_keys, &resolved);
+        assert_key_eq(&file_keys, &resolved.keys);
         // Marker written, file deleted — the safe resting state.
         assert!(migration_marker_path(dir.path()).exists());
         assert!(!legacy_path.exists());
@@ -981,7 +1131,7 @@ mod tests {
                 .borrow()
                 .get(IDENTITY_KEY_NAME)
                 .map(String::as_str),
-            Some(resolved.secret_key().to_bech32().unwrap().as_str())
+            Some(resolved.keys.secret_key().to_bech32().unwrap().as_str())
         );
     }
 
@@ -1025,8 +1175,160 @@ mod tests {
 
         // Key persisted to the file (fallback), and recoverable from it.
         let from_file = load_key_file(&legacy_path).unwrap();
-        assert_key_eq(&resolved, &from_file);
+        assert_key_eq(&resolved.keys, &from_file);
         // No marker: the file is the authoritative store, not the keyring.
+        assert!(!migration_marker_path(dir.path()).exists());
+    }
+
+    // ── New tests for the three defects fixed in this PR ─────────────────────
+
+    #[test]
+    fn import_persists_to_keyring_reboot_resolves_imported_pubkey() {
+        // (a) import persists to keyring → simulated reboot resolves the
+        // imported pubkey.
+        //
+        // `persist_identity_to_keyring` is the kernel called by
+        // `import_identity`. After it succeeds the keyring slot holds the
+        // imported nsec. A fresh store seeded with that nsec (simulating a
+        // reboot where the keyring has the value) must resolve to the same key.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("identity.key");
+        let imported_keys = Keys::generate();
+
+        // Simulate what import_identity does: persist to keyring.
+        let store_import = FakeIdentityStore::reachable_but_empty();
+        persist_identity_to_keyring(&store_import, &imported_keys, &legacy_path, dir.path())
+            .expect("persist_identity_to_keyring must succeed with a reachable store");
+
+        // Keyring slot now holds the imported nsec.
+        let stored_nsec = store_import
+            .slot
+            .borrow()
+            .get(IDENTITY_KEY_NAME)
+            .cloned()
+            .expect("keyring must hold the imported nsec after persist");
+        assert_eq!(stored_nsec, imported_keys.secret_key().to_bech32().unwrap());
+
+        // Simulated reboot: new store with Present probe, seeded with the stored nsec.
+        let store_reboot = FakeIdentityStore::present_with(&stored_nsec);
+        let resolved =
+            resolve_identity_with_store(&store_reboot, &legacy_path, dir.path()).unwrap();
+
+        // The resolved key is the imported one — identity survives the reboot.
+        assert_key_eq(&imported_keys, &resolved.keys);
+        assert!(!resolved.lost);
+        // No identity.key left on disk (was deleted by persist_identity_to_keyring).
+        assert!(!legacy_path.exists());
+    }
+
+    #[test]
+    fn present_keyring_with_mismatched_file_adopts_file_key() {
+        // (b) Present + mismatched identity.key → file's key adopted into
+        // keyring, no data loss, file removed.
+        //
+        // This auto-heals installs already stuck in the re-onboarding loop:
+        // the keyring holds the shadow key generated at first launch, while
+        // identity.key holds the user's imported key from a subsequent import
+        // that only reached the file (pre-fix bug). Resolution must adopt the
+        // file's key as the user's explicit intent.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("identity.key");
+
+        let keyring_keys = Keys::generate();
+        let keyring_nsec = keyring_keys.secret_key().to_bech32().unwrap();
+
+        // identity.key has a DIFFERENT key — the user's import.
+        let file_keys = Keys::generate();
+        save_key_file(&legacy_path, &file_keys).unwrap();
+
+        let store = FakeIdentityStore::present_with(&keyring_nsec);
+        let resolved = resolve_identity_with_store(&store, &legacy_path, dir.path()).unwrap();
+
+        // The file's key (user's explicit import) wins.
+        assert_key_eq(&file_keys, &resolved.keys);
+        assert!(!resolved.lost);
+
+        // The keyring now holds the file's key (overwritten with read-back verify).
+        let file_nsec = file_keys.secret_key().to_bech32().unwrap();
+        assert_eq!(
+            store
+                .slot
+                .borrow()
+                .get(IDENTITY_KEY_NAME)
+                .map(String::as_str),
+            Some(file_nsec.as_str())
+        );
+
+        // identity.key was removed after adoption.
+        assert!(!legacy_path.exists());
+    }
+
+    #[test]
+    fn reachable_but_empty_with_marker_and_no_file_returns_lost() {
+        // (d) ReachableButEmpty + marker + no file → "lost" state, NO new key
+        // generated into the keyring.
+        //
+        // The marker says a key was once stored in the keyring. If the keyring
+        // is now empty (entry deleted externally, new OS login session cleared
+        // it, etc.) and there is no file fallback, the user's key is truly
+        // gone. Resolution must NOT silently generate a new identity; it must
+        // surface a "lost" state so the frontend can prompt re-import.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("identity.key");
+        // Write the migration marker — a key was once in the keyring.
+        write_migration_marker(&migration_marker_path(dir.path())).unwrap();
+        assert!(!legacy_path.exists()); // no file fallback
+
+        let store = FakeIdentityStore::reachable_but_empty();
+        let resolved = resolve_identity_with_store(&store, &legacy_path, dir.path()).unwrap();
+
+        // The "lost" flag is set — the frontend must prompt re-import.
+        assert!(resolved.lost, "identity lost state must be surfaced");
+
+        // No key was persisted to the keyring — the ephemeral key is in-memory
+        // only and must not overwrite the user's actual (externally lost) key.
+        assert!(
+            store.slot.borrow().is_empty(),
+            "no key must be written to keyring when identity is lost"
+        );
+
+        // No identity.key written either — the ephemeral key is transient.
+        assert!(!legacy_path.exists());
+    }
+
+    #[test]
+    fn import_keyring_failure_falls_back_to_file_so_key_is_recoverable() {
+        // (e) keyring-write failure during import → file fallback survives so
+        // the key is recoverable on next boot.
+        //
+        // When the keyring is unavailable, `persist_identity_to_keyring`
+        // returns Err and the caller writes identity.key as a fallback. No
+        // migration marker must be written — a marker here would wrongly trip
+        // the Unreachable-boot fail-closed check even though the key is in the
+        // file.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("identity.key");
+        let imported_keys = Keys::generate();
+
+        // Keyring write always fails.
+        let store = FakeIdentityStore::store_failing();
+        let result = persist_identity_to_keyring(&store, &imported_keys, &legacy_path, dir.path());
+
+        assert!(
+            result.is_err(),
+            "persist_identity_to_keyring must propagate keyring failure"
+        );
+
+        // Caller falls back: write the file so the key survives.
+        save_key_file(&legacy_path, &imported_keys).unwrap();
+
+        // Key is recoverable from the file on next boot.
+        let from_file = load_key_file(&legacy_path).unwrap();
+        assert_key_eq(&imported_keys, &from_file);
+
+        // No marker written — the file is the authoritative store, not the
+        // keyring, and a marker would cause fail-closed on a later Unreachable
+        // boot.
         assert!(!migration_marker_path(dir.path()).exists());
     }
 }

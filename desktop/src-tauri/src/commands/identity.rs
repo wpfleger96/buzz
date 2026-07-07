@@ -23,10 +23,14 @@ pub fn get_identity(state: State<'_, AppState>) -> Result<IdentityInfo, String> 
     } else {
         bech32
     };
+    let lost = state
+        .identity_lost
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     Ok(IdentityInfo {
         pubkey: pubkey_hex,
         display_name,
+        lost,
     })
 }
 
@@ -173,16 +177,34 @@ pub fn import_identity(
     let trimmed = nsec.trim();
     let keys = Keys::parse(trimmed).map_err(|e| format!("Invalid private key: {e}"))?;
 
-    // Persist to identity.key
     let data_dir = app_handle
         .path()
         .app_data_dir()
         .map_err(|e| format!("app data dir: {e}"))?;
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create app data dir: {e}"))?;
     let key_path = data_dir.join("identity.key");
-    crate::app_state::save_key_file(&key_path, &keys)?;
 
-    // Update in-memory keys
+    // Persist into the OS keyring first (store → read-back verify → marker →
+    // delete file). On an unavailable keyring, fall back to the 0o600 file so
+    // the imported key at least survives this boot and can be migrated later.
+    let store = crate::secret_store::SecretStore::shared(crate::app_state::KEYRING_SERVICE);
+    match crate::app_state::import_identity_to_keyring(store, &keys, &key_path, &data_dir) {
+        Ok(()) => {}
+        Err(keyring_err) => {
+            eprintln!(
+                "buzz-desktop: keyring write failed during import ({keyring_err}), \
+                 falling back to identity.key"
+            );
+            crate::app_state::save_key_file(&key_path, &keys)?;
+        }
+    }
+
+    // Clear the "identity lost" flag — the user has now successfully imported.
+    state
+        .identity_lost
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Update in-memory keys.
     let pubkey = keys.public_key();
     *state.keys.lock().map_err(|e| e.to_string())? = keys;
 
@@ -201,6 +223,7 @@ pub fn import_identity(
     Ok(IdentityInfo {
         pubkey: pubkey_hex,
         display_name,
+        lost: false,
     })
 }
 

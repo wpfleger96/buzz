@@ -106,6 +106,10 @@ export type AddChannelMembersResult = {
 export type Identity = {
   pubkey: string;
   displayName: string;
+  /** True when the app booted in "identity lost" recovery mode — the OS
+   *  keyring was empty despite a prior successful migration. The frontend
+   *  should route to nsec re-import instead of normal onboarding. */
+  lost?: boolean;
 };
 
 export type Profile = {

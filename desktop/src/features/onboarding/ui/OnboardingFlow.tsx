@@ -73,6 +73,7 @@ async function checkMembershipDenied(): Promise<boolean> {
 type OnboardingFlowProps = {
   actions: OnboardingActions;
   canBackToWorkspaceSetup: boolean;
+  identityLost?: boolean;
   initialProfile: OnboardingProfileSeed;
   onBackToWorkspaceSetup: () => void;
 };
@@ -142,6 +143,7 @@ function resolveProfileSaveRecovery(
 export function OnboardingFlow({
   actions,
   canBackToWorkspaceSetup,
+  identityLost = false,
   initialProfile,
   onBackToWorkspaceSetup,
 }: OnboardingFlowProps) {
@@ -151,8 +153,11 @@ export function OnboardingFlow({
   const profileUpdateMutation = useUpdateProfileMutation();
   const { error: profileSaveError, isPending: isSavingProfile } =
     profileUpdateMutation;
-  const [currentPage, setCurrentPage] =
-    React.useState<OnboardingPage>("profile");
+  // When identity was lost (keyring cleared after migration), land the user
+  // directly on the import step with a recovery notice rather than profile setup.
+  const [currentPage, setCurrentPage] = React.useState<OnboardingPage>(
+    identityLost ? "key-import" : "profile",
+  );
   const [profileDraft, setProfileDraft] =
     React.useState<OnboardingProfileValues>(savedProfile);
   const [deniedPubkey, setDeniedPubkey] = React.useState<string>("");
@@ -495,14 +500,29 @@ export function OnboardingFlow({
             transitionKey={`key-import-${transitionDirection}`}
           >
             <div className="w-full max-w-[440px]">
-              <h1 className="text-3xl font-semibold tracking-tight">
-                Use your existing key
-              </h1>
-              <p className="mt-3 text-sm leading-6 text-muted-foreground">
-                Import your Nostr private key to use that identity with Buzz. If
-                this key already has a profile on the relay, your name and
-                avatar are restored automatically.
-              </p>
+              {identityLost ? (
+                <>
+                  <h1 className="text-3xl font-semibold tracking-tight">
+                    Re-import your key
+                  </h1>
+                  <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                    Your identity is no longer in the system keyring. Re-import
+                    your nsec to restore it, or go back to create a new
+                    identity.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <h1 className="text-3xl font-semibold tracking-tight">
+                    Use your existing key
+                  </h1>
+                  <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                    Import your Nostr private key to use that identity with
+                    Buzz. If this key already has a profile on the relay, your
+                    name and avatar are restored automatically.
+                  </p>
+                </>
+              )}
             </div>
 
             <NostrKeyImportForm

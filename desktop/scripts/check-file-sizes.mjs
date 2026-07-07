@@ -116,7 +116,8 @@ const overrides = new Map([
   // linux-updater isAutoUpdateSupported() binding + onboarding has_profile_event field.
   // config-bridge-aware requirements: getRuntimeFileConfig command adds ~15 lines.
   // +26 lines from PRs landing on main between prior rebase and this rebase.
-  ["src/shared/api/tauri.ts", 1375],
+  // identity-import-keyring: +1 for `lost` field in RawIdentity type.
+  ["src/shared/api/tauri.ts", 1376],
   // readiness-gate: PersonaDialog.tsx threads computeLocalModeGate +
   // requiredCredentialEnvKeys + RequiredFieldLabel so the "New agent" dialog
   // shows required markers and credential amber rows (parity with
@@ -164,7 +165,11 @@ const overrides = new Map([
   // uid-keyed lockfile path + behavioral tests add ~303 lines. Load-bearing
   // security fix for the lost-update race that stranded agent keys.
   ["src-tauri/src/secret_store.rs", 1043],
-  ["src-tauri/src/app_state.rs", 1033],
+  // identity-import-keyring: ResolvedIdentity + persist_identity_to_keyring +
+  // import_identity_to_keyring + pubkey-compare adoption branch + lost-identity
+  // recovery + 5 new behavior tests. Load-bearing correctness fix; queued to
+  // split test module into app_state_tests.rs.
+  ["src-tauri/src/app_state.rs", 1352],
   // multi-slot splitting + no-op suppression (#1309): the ReadStateManager
   // class grew from ~700 lines to ~1019 with the addition of
   // splitContextsIntoBudgetedSlots (pure fn + 5 tests), publishSplitSlots,

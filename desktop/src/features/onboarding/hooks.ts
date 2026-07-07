@@ -122,6 +122,7 @@ type OnboardingGateStage = "blocking" | "onboarding" | "ready";
 type UseFirstRunOnboardingGateOptions = {
   currentPubkey: string | null;
   identityIsFetching: boolean;
+  identityLost: boolean;
   identityStatus: QueryStatus;
   isSharedIdentity: boolean;
   profileHasEvent: boolean | undefined;
@@ -217,6 +218,7 @@ function resolveOnboardingGateStage({
 export function useFirstRunOnboardingGate({
   currentPubkey,
   identityIsFetching,
+  identityLost,
   identityStatus,
   isSharedIdentity,
   profileHasEvent,
@@ -237,6 +239,23 @@ export function useFirstRunOnboardingGate({
         : createOnboardingGateState(currentPubkey),
     );
   }, [currentPubkey]);
+
+  // When the backend signals "identity lost" (keyring was cleared after a
+  // successful migration), force onboarding open immediately so the user can
+  // re-import their nsec. This runs once, after identity settles.
+  React.useEffect(() => {
+    if (!identityLost || !currentPubkey || identityStatus !== "success") {
+      return;
+    }
+    setGateState((current) =>
+      updateActiveGateState(current, currentPubkey, (activeGateState) => ({
+        ...activeGateState,
+        hasCompletedCurrentPubkey: false,
+        hasSettledCurrentPubkey: true,
+        isOpen: true,
+      })),
+    );
+  }, [currentPubkey, identityLost, identityStatus]);
 
   React.useEffect(() => {
     // Fast-path: shared identity worktrees have already onboarded in the
@@ -390,9 +409,11 @@ export function useAppOnboardingState(isSharedIdentity: boolean) {
   const [isCompletingWelcomeSetup, setIsCompletingWelcomeSetup] =
     React.useState(false);
   const profileQuery = useProfileQuery();
+  const identityLost = identity?.lost === true;
   const onboardingGate = useFirstRunOnboardingGate({
     currentPubkey,
     identityIsFetching: identityQuery.fetchStatus === "fetching",
+    identityLost,
     identityStatus: identityQuery.status,
     isSharedIdentity,
     profileHasEvent: profileQuery.data?.hasProfileEvent,
@@ -472,6 +493,7 @@ export function useAppOnboardingState(isSharedIdentity: boolean) {
   return {
     currentPubkey,
     flow,
+    identityLost,
     stage: isCompletingWelcomeSetup ? "blocking" : onboardingGate.stage,
   };
 }
